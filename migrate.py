@@ -45,6 +45,9 @@ GITLAB_ARCHIVE_MIGRATED_PROJECTS = (os.getenv('GITLAB_ARCHIVE_MIGRATED_PROJECTS'
 
 
 def main():
+    global f
+    f = open("c:/temp/gitea.txt", "w")
+
     print_color(bcolors.HEADER, "---=== Gitlab to Gitea migration ===---")
     print("Version: " + SCRIPT_VERSION)
     print()
@@ -119,6 +122,7 @@ def main():
     else:
         print_error("Migration finished with " + str(GLOBAL_ERROR_COUNT) + " errors!")
 
+    f.close()
 
 # 
 # Data loading helpers for Gitea
@@ -469,6 +473,8 @@ def _import_project_repo(gitea_api: pygitea, project: gitlab.v4.objects.Project)
                 print_info("Project " + name_clean(project.name) + " imported!")
             else:
                 print_error("Project " + name_clean(project.name) + " import failed: " + import_response.text)
+                f.write(project.namespace['name'] + "/" + name_clean(project.name) + "\n")
+                f.flush()
         else:
             print_error("Failed to load project owner for project " + name_clean(project.name))
 
