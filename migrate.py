@@ -1,5 +1,6 @@
 import base64
 import os
+import sys
 import time
 import random
 import string
@@ -23,7 +24,7 @@ GLOBAL_ERROR_COUNT = 0
 
 # Gitea user to use as a fallback for groups
 # for cases where the user's permissions are too limited to access group member details on GitLab.
-GITEA_FALLBACK_GROUP_MEMBER = os.getenv('GITEA_FALLBACK_GROUP_MEMBER', 'gitea_admin')
+GITEA_FALLBACK_GROUP_MEMBER = os.getenv('GITEA_FALLBACK_GROUP_MEMBER', 'root')
 
 REPOSITORY_MIRROR = (os.getenv('REPOSITORY_MIRROR', 'false')) == 'true' # if true, the repository will be mirrored
 GITLAB_URL = os.getenv('GITLAB_URL', 'https://gitlab.source.com')
@@ -53,8 +54,12 @@ GITLAB_ARCHIVE_MIGRATED_PROJECTS = (os.getenv('GITLAB_ARCHIVE_MIGRATED_PROJECTS'
 # CONFIG SECTION END
 #######################
 
-
 def main():
+    global statusProject, statusUser, statusGroup
+    statusProject = open("project.csv", "w")
+    statusUser = open("user.csv", "w")
+    statusGroup = open("group.csv", "w")
+
     print_color(bcolors.HEADER, "---=== Gitlab to Gitea migration ===---")
     print("Version: " + SCRIPT_VERSION)
     print()
@@ -134,6 +139,9 @@ def main():
     else:
         print_error("Migration finished with " + str(GLOBAL_ERROR_COUNT) + " errors!")
 
+    statusProject.close()
+    statusUser.close()
+    statusGroup.close()
 
 # 
 # Data loading helpers for Gitea
@@ -483,10 +491,15 @@ def _import_project_repo(gitea_api: pygitea, project: gitlab.v4.objects.Project)
             })
             if import_response.ok:
                 print_info("Project " + name_clean(project.name) + " imported!")
+                statusProject.write("success\n")
             else:
                 print_error("Project " + name_clean(project.name) + " import failed: " + import_response.text)
+                statusProject.write("fail\n")
         else:
             print_error("Failed to load project owner for project " + name_clean(project.name))
+            statusProject.write("no_owner\n")
+    else:
+        statusProject.write("exist\n")
 
 
 def _import_project_repo_collaborators(gitea_api: pygitea, collaborators: [gitlab.v4.objects.ProjectMember], project: gitlab.v4.objects.Project):
@@ -519,35 +532,44 @@ def _import_project_repo_collaborators(gitea_api: pygitea, collaborators: [gitla
 
 
 def _import_users(gitea_api: pygitea, users: [gitlab.v4.objects.User], notify: bool = False):
+    statusUser.write("username,name,email,result\n")
     for user in users:
         keys: [gitlab.v4.objects.UserKey] = user.keys.list(all=True)
 
         print("Importing user " + user.username + "...")
         print("Found " + str(len(keys)) + " public keys for user " + user.username)
 
-        if not user_exists(gitea_api, user.username):
-            tmp_password = 'Tmp1!' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-            tmp_email = user.username + '@noemail-git.local'  # Some gitlab instances do not publish user emails
-            try:
-                tmp_email = user.email
-            except AttributeError:
-                pass
-            import_response: requests.Response = gitea_api.post("/admin/users", json={
-                "email": tmp_email,
-                "full_name": user.name,
-                "login_name": user.username,
-                "password": tmp_password,
-                "send_notify": notify,
-                "source_id": 0, # local user
-                "username": user.username
-            })
-            if import_response.ok:
-                print_info("User " + user.username + " imported, temporary password: " + tmp_password)
+        statusUser.write("{},{},{},".format(user.username, user.name, user.email))
+
+        if not dryrun:
+            if not user_exists(gitea_api, user.username):
+                tmp_password = 'Tmp1!' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+                tmp_email = user.username + '@noemail-git.local'  # Some gitlab instances do not publish user emails
+                try:
+                    tmp_email = user.email
+                except AttributeError:
+                    pass
+                import_response: requests.Response = gitea_api.post("/admin/users", json={
+                    "email": tmp_email,
+                    "full_name": user.name,
+                    "login_name": user.username,
+                    "password": tmp_password,
+                    "send_notify": notify,
+                    "source_id": 0, # local user
+                    "username": user.username
+                })
+                if import_response.ok:
+                    print_info("User " + user.username + " imported, temporary password: " + tmp_password)
+                    statusUser.write("success\n")
+                else:
+                    print_error("User " + user.username + " import failed: " + import_response.text)
+                    statusUser.write("fail\n")
             else:
-                print_error("User " + user.username + " import failed: " + import_response.text)
-        
-        # import public keys
-        _import_user_keys(gitea_api, keys, user)
+                statusUser.write("exist\n")
+
+            # import public keys
+            _import_user_keys(gitea_api, keys, user)
+    statusUser.flush()
 
 
 def _import_user_keys(gitea_api: pygitea, keys: [gitlab.v4.objects.UserKey], user: gitlab.v4.objects.User):
@@ -565,30 +587,39 @@ def _import_user_keys(gitea_api: pygitea, keys: [gitlab.v4.objects.UserKey], use
 
 
 def _import_groups(gitea_api: pygitea, groups: [gitlab.v4.objects.Group]):
+    statusGroup.write("name,fullname,new_name\n")
     for group in groups:
-        try:
-            members: [gitlab.v4.objects.GroupMember] = group.members.list(all=True)
-        except Exception as e:
-            print("Skipping group member import for group " + group.full_path + " due to error: " + str(e))
-            continue
-        print("Importing group " + name_clean(group.name) + "...")
-        print("Found " + str(len(members)) + " gitlab members for group " + name_clean(group.name))
+        statusGroup.write("{},{},{},".format(group.name, group.full_name, name_clean(group.name)))
 
-        if not organization_exists(gitea_api, name_clean(group.name)):
-            import_response: requests.Response = gitea_api.post("/orgs", json={
-                "description": group.description,
-                "full_name": group.full_name,
-                "location": "",
-                "username": name_clean(group.name),
-                "website": ""
-            })
-            if import_response.ok:
-                print_info("Group " + name_clean(group.name) + " imported!")
+        if not dryrun:
+            try:
+                members: [gitlab.v4.objects.GroupMember] = group.members.list(all=True)
+            except Exception as e:
+                print("Skipping group member import for group " + group.full_path + " due to error: " + str(e))
+                continue
+            print("Importing group " + name_clean(group.name) + "...")
+            print("Found " + str(len(members)) + " gitlab members for group " + name_clean(group.name))
+
+            if not organization_exists(gitea_api, name_clean(group.name)):
+                import_response: requests.Response = gitea_api.post("/orgs", json={
+                    "description": group.description,
+                    "full_name": group.full_name,
+                    "location": "",
+                    "username": name_clean(group.name),
+                    "website": ""
+                })
+                if import_response.ok:
+                    print_info("Group " + name_clean(group.name) + " imported!")
+                    statusGroup.write("success\n")
+                else:
+                    print_error("Group " + name_clean(group.name) + " import failed: " + import_response.text)
+                    statusGroup.write("fail\n")
             else:
-                print_error("Group " + name_clean(group.name) + " import failed: " + import_response.text)
+                statusGroup.write("exist\n")
 
-        # import group members
-        _import_group_members(gitea_api, members, group)
+            # import group members
+            _import_group_members(gitea_api, members, group)
+    statusGroup.flush()
 
 
 def _import_group_members(gitea_api: pygitea, members: [gitlab.v4.objects.GroupMember], group: gitlab.v4.objects.Group):
@@ -629,48 +660,53 @@ def import_users_groups(gitlab_api: gitlab.Gitlab, gitea_api: pygitea, users: Li
 
 
 def import_projects(gitlab_api: gitlab.Gitlab, gitea_api: pygitea, projects: List[gitlab.v4.objects.Project]):
+    statusProject.write("name,path,owner,new_name,result\n")
     print("Found " + str(len(projects)) + " gitlab projects as user " + gitlab_api.user.username)
 
     for project in projects:
-        if GITLAB_ARCHIVE_MIGRATED_PROJECTS:
+        statusProject.write("{},{},{},{},".format(project.name, project.namespace['path'], name_clean(project.name), name_clean(project.namespace['path'])))
+
+        if not dryrun:
+            if GITLAB_ARCHIVE_MIGRATED_PROJECTS:
+                try:
+                    project.archive()
+                except Exception as e:
+                    print("WARNING: Failed to archive project '{}', reason: {}".format(project.name, e))
+
             try:
-                project.archive()
+                collaborators: [gitlab.v4.objects.ProjectMember] = project.members.list(all=True)
+                labels: [gitlab.v4.objects.ProjectLabel] = project.labels.list(all=True)
+                milestones: [gitlab.v4.objects.ProjectMilestone] = project.milestones.list(all=True)
+                issues: [gitlab.v4.objects.ProjectIssue] = project.issues.list(all=True)
+
+                print("Importing project " + name_clean(project.name) + " from owner " + name_clean(project.namespace['name']))
+                print("Found " + str(len(collaborators)) + " collaborators for project " + name_clean(project.name))
+                print("Found " + str(len(labels)) + " labels for project " + name_clean(project.name))
+                print("Found " + str(len(milestones)) + " milestones for project " + name_clean(project.name))
+                print("Found " + str(len(issues)) + " issues for project " + name_clean(project.name))
+
             except Exception as e:
-                print("WARNING: Failed to archive project '{}', reason: {}".format(project.name, e))
-        
-        try:
-            collaborators: [gitlab.v4.objects.ProjectMember] = project.members.list(all=True)
-            labels: [gitlab.v4.objects.ProjectLabel] = project.labels.list(all=True)
-            milestones: [gitlab.v4.objects.ProjectMilestone] = project.milestones.list(all=True)
-            issues: [gitlab.v4.objects.ProjectIssue] = project.issues.list(all=True)
+                print("This project failed: \n {}, \n reason {}: ".format(project.name, e))
 
-            print("Importing project " + name_clean(project.name) + " from owner " + name_clean(project.namespace['name']))
-            print("Found " + str(len(collaborators)) + " collaborators for project " + name_clean(project.name))
-            print("Found " + str(len(labels)) + " labels for project " + name_clean(project.name))
-            print("Found " + str(len(milestones)) + " milestones for project " + name_clean(project.name))
-            print("Found " + str(len(issues)) + " issues for project " + name_clean(project.name))
+            else:
+                projectOwner = name_clean(project.namespace['path'])
+                projectName = name_clean(project.name)
 
-        except Exception as e:
-            print("This project failed: \n {}, \n reason {}: ".format(project.name, e))
-        
-        else:
-            projectOwner = name_clean(project.namespace['path'])
-            projectName = name_clean(project.name)
+                # import project repo
+                _import_project_repo(gitea_api, project)
 
-            # import project repo
-            _import_project_repo(gitea_api, project)
+                # import collaborators
+                _import_project_repo_collaborators(gitea_api, collaborators, project)
 
-            # import collaborators
-            _import_project_repo_collaborators(gitea_api, collaborators, project)
+                # import labels
+                _import_project_labels(gitea_api, labels, projectOwner, projectName)
 
-            # import labels
-            _import_project_labels(gitea_api, labels, projectOwner, projectName)
+                # import milestones
+                _import_project_milestones(gitea_api, milestones, projectOwner, projectName)
 
-            # import milestones
-            _import_project_milestones(gitea_api, milestones, projectOwner, projectName)
-
-            # import issues
-            _import_project_issues(gitea_api, issues, projectOwner, projectName)
+                # import issues
+                _import_project_issues(gitea_api, issues, projectOwner, projectName)
+    statusProject.flush()
 
 
 #
@@ -727,4 +763,9 @@ def name_clean(name):
 
 
 if __name__ == "__main__":
+    global dryrun
+    dryrun = False
+    if sys.argv[1] and (sys.argv[1] == 'dryrun'):
+        dryrun = True
+
     main()
